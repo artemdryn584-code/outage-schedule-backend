@@ -56,11 +56,6 @@ async function fetchYasnoPlannedOutages(region) {
 }
 
 // GET /api/schedule/raw?region=kiev
-// Returns Yasno's response completely unprocessed. Use this first to see
-// the actual current shape of their data — the "type" field names,
-// group/queue naming, whether it's start/end or startTime/endTime, etc.
-// Once we know the real shape from this, /api/schedule/group's parsing
-// can be corrected to match it exactly instead of guessing.
 app.get("/api/schedule/raw", async (req, res) => {
   const region = (req.query.region || "kiev").toLowerCase();
   try {
@@ -72,8 +67,6 @@ app.get("/api/schedule/raw", async (req, res) => {
 });
 
 // GET /api/schedule?region=kiev
-// Best-effort parsed version. Tries a few common field-name shapes since
-// we haven't confirmed the exact schema yet (use /api/schedule/raw to check).
 app.get("/api/schedule", async (req, res) => {
   const region = (req.query.region || "kiev").toLowerCase();
   try {
@@ -100,15 +93,18 @@ app.get("/api/schedule/group", async (req, res) => {
   try {
     const raw = await fetchYasnoPlannedOutages(region);
     const groups = extractGroups(raw);
-    const windows = groups[group];
-    if (!windows) {
+    const statuses = extractGroupStatuses(raw);
+    if (!(group in groups)) {
       return res.status(404).json({
         error: `No group "${group}" found for region "${region}".`,
         availableGroups: Object.keys(groups),
       });
     }
     res.json({
-      region, group, windows,
+      region, group,
+      windows: groups[group],
+      status: statuses[group]?.status || null,
+      date: statuses[group]?.date || null,
       cachedAt: new Date((cache[region] || {}).fetchedAt || Date.now()).toISOString(),
       source: "unofficial Yasno API — not an official feed, verify against yasno.ua for anything important",
     });
@@ -117,29 +113,41 @@ app.get("/api/schedule/group", async (req, res) => {
   }
 });
 
-// Defensive parser: tries several plausible shapes for the outage list,
-// since we haven't locked down the exact current schema. Falls back to
-// an empty object (frontend treats that as "no live data available")
-// rather than throwing, so one shape mismatch doesn't break the endpoint.
+// Confirmed real shape (checked 2026-09-03) — raw is an object keyed
+// directly by group, e.g. { "1.1": { today: { slots: [...], status,
+// date }, tomorrow: {...}, updatedOn }, "2.1": {...}, ... }.
 function extractGroups(raw) {
   try {
-    // shape guess 1: raw is an array of { queue/group, start/end or startTime/endTime }
-    const list = Array.isArray(raw) ? raw : raw.data || raw.outages || raw.events || null;
-    if (!Array.isArray(list)) return {};
-
     const groups = {};
-    for (const item of list) {
-      const groupKey = String(item.group ?? item.queue ?? item.groupId ?? item.subQueue ?? "unknown");
-      const start = item.start ?? item.startTime ?? item.from;
-      const end = item.end ?? item.endTime ?? item.to;
-      if (start == null || end == null) continue;
-      if (!groups[groupKey]) groups[groupKey] = [];
-      groups[groupKey].push({ start: toHourFraction(start), end: toHourFraction(end), type: item.type || "OUTAGE" });
+    for (const [groupKey, groupData] of Object.entries(raw || {})) {
+      const slots = groupData?.today?.slots || [];
+      groups[groupKey] = slots
+        .map(slot => ({
+          start: toHourFraction(slot.start ?? slot.startTime ?? slot.from),
+          end: toHourFraction(slot.end ?? slot.endTime ?? slot.to),
+          type: slot.type || "OUTAGE",
+        }))
+        .filter(w => !isNaN(w.start) && !isNaN(w.end));
     }
     return groups;
   } catch {
     return {};
   }
+}
+
+// Pulls each group's status/date info alongside the parsed windows, so
+// the frontend can show "no outages scheduled today" instead of an
+// ambiguous empty grid.
+function extractGroupStatuses(raw) {
+  const statuses = {};
+  for (const [groupKey, groupData] of Object.entries(raw || {})) {
+    statuses[groupKey] = {
+      status: groupData?.today?.status || null,
+      date: groupData?.today?.date || null,
+      updatedOn: groupData?.updatedOn || null,
+    };
+  }
+  return statuses;
 }
 
 // Normalizes either a fractional-hour number (12.5) or an ISO/time string
