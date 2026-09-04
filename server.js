@@ -26,6 +26,106 @@ const KNOWN_REGIONS = {
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes — be gentle with an unofficial source
 const cache = {}; // keyed by region -> { data, fetchedAt }
 
+// alerts.energy — a Ukrainian aggregator covering all 27 regions in one
+// place (unlike Yasno, which only covers Kyiv/Dnipro). Also unofficial/
+// undocumented — discovered via browser devtools, same caveats apply.
+const ALERTS_ENERGY_BASE = "https://alerts.energy/api/v1/source-registry/areas";
+// Slugs match exactly what alerts.energy uses in its own page URLs.
+const ALERTS_ENERGY_REGIONS = [
+  "avtonomna-respublika-krym", "vinnytska-oblast", "volynska-oblast",
+  "dnipropetrovska-oblast", "donetska-oblast", "zhytomyrska-oblast",
+  "zakarpatska-oblast", "zaporizka-oblast", "ivano-frankivska-oblast",
+  "kyivska-oblast", "kirovogradska-oblast", "luganska-oblast",
+  "lvivska-oblast", "mikolayivska-oblast", "odeska-oblast",
+  "poltavska-oblast", "rivnenska-oblast", "sumska-oblast",
+  "ternopilska-oblast", "kharkivska-oblast", "khersonska-oblast",
+  "khmelnytska-oblast", "cherkaska-oblast", "chernivecka-oblast",
+  "chernigivska-oblast", "sevastopol", "kyiv",
+];
+const alertsEnergyCache = {}; // keyed by region slug -> { data, fetchedAt }
+
+async function fetchAlertsEnergy(regionSlug) {
+  const now = Date.now();
+  const cached = alertsEnergyCache[regionSlug];
+  if (cached && now - cached.fetchedAt < CACHE_TTL_MS) {
+    return cached.data;
+  }
+  if (!ALERTS_ENERGY_REGIONS.includes(regionSlug)) {
+    throw new Error(`Unknown alerts.energy region slug "${regionSlug}"`);
+  }
+  const url = `${ALERTS_ENERGY_BASE}/${regionSlug}/shutdowns`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; outage-schedule-proxy/1.0)",
+      "Accept": "application/json",
+      "Referer": "https://alerts.energy/",
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`alerts.energy API responded with ${res.status}`);
+  }
+  const json = await res.json();
+  alertsEnergyCache[regionSlug] = { data: json, fetchedAt: now };
+  return json;
+}
+
+// alerts.energy's "today"/"tomorrow" arrays can be 24 (hourly) or 48
+// (half-hourly) long. This samples evenly into a 24-slot on/off grid
+// regardless of the source resolution. 0 = no outage (assumed based on
+// an all-clear day observed while building this — unconfirmed against
+// an actual outage example).
+function alertsEnergyArrayToHours(arr) {
+  const hours = Array(24).fill(true);
+  if (!Array.isArray(arr) || arr.length === 0) return hours;
+  for (let h = 0; h < 24; h++) {
+    const idx = Math.floor((h * arr.length) / 24);
+    hours[h] = Number(arr[idx]) === 0;
+  }
+  return hours;
+}
+
+// GET /api/alerts-energy/regions — list of supported region slugs
+app.get("/api/alerts-energy/regions", (req, res) => {
+  res.json({ regions: ALERTS_ENERGY_REGIONS });
+});
+
+// GET /api/alerts-energy/raw?region=lvivska-oblast
+app.get("/api/alerts-energy/raw", async (req, res) => {
+  const region = req.query.region;
+  if (!region) return res.status(400).json({ error: "Pass ?region=lvivska-oblast (see /api/alerts-energy/regions for the full list)." });
+  try {
+    const raw = await fetchAlertsEnergy(region);
+    res.json(raw);
+  } catch (err) {
+    res.status(502).json({ error: "Could not reach the upstream schedule source.", detail: err.message });
+  }
+});
+
+// GET /api/alerts-energy/schedule?region=lvivska-oblast
+// Returns every queue for the region, each converted to a 24-slot grid.
+app.get("/api/alerts-energy/schedule", async (req, res) => {
+  const region = req.query.region;
+  if (!region) return res.status(400).json({ error: "Pass ?region=lvivska-oblast." });
+  try {
+    const raw = await fetchAlertsEnergy(region);
+    const entries = Array.isArray(raw) ? raw : [];
+    const queues = entries.map(e => ({
+      queue: e.queue,
+      initiator: e.initiator || null,
+      today: alertsEnergyArrayToHours(e.today),
+      tomorrow: e.tomorrow ? alertsEnergyArrayToHours(e.tomorrow) : null,
+      updated: e.updated || null,
+    }));
+    res.json({
+      region, queues,
+      cachedAt: new Date((alertsEnergyCache[region] || {}).fetchedAt || Date.now()).toISOString(),
+      source: "unofficial alerts.energy API — not an official feed, verify against alerts.energy for anything important",
+    });
+  } catch (err) {
+    res.status(502).json({ error: "Could not reach the upstream schedule source.", detail: err.message });
+  }
+});
+
 async function fetchYasnoPlannedOutages(region) {
   const now = Date.now();
   const cached = cache[region];
