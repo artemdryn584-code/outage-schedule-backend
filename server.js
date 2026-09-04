@@ -20,6 +20,7 @@ app.use(cors());
 const YASNO_BASE = "https://app.yasno.ua/api/blackout-service/public/shutdowns";
 const KNOWN_REGIONS = {
   kiev: { regionId: 25, dsoId: 902 },
+  dnipro: { regionId: 3, dsoId: 301 },
 };
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes — be gentle with an unofficial source
