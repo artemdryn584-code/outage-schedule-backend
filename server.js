@@ -14,23 +14,17 @@ const app = express();
 app.use(cors());
 
 // Yasno's current (as of testing) blackout-service API.
-// We only have one confirmed working region/dso pair — Yasno doesn't
-// publish a directory of these, so more regions would need to be
-// discovered by inspecting network requests on yasno.ua directly.
 const YASNO_BASE = "https://app.yasno.ua/api/blackout-service/public/shutdowns";
 const KNOWN_REGIONS = {
   kiev: { regionId: 25, dsoId: 902 },
   dnipro: { regionId: 3, dsoId: 301 },
 };
 
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes — be gentle with an unofficial source
-const cache = {}; // keyed by region -> { data, fetchedAt }
+const CACHE_TTL_MS = 5 * 60 * 1000;
+const cache = {};
 
-// alerts.energy — a Ukrainian aggregator covering all 27 regions in one
-// place (unlike Yasno, which only covers Kyiv/Dnipro). Also unofficial/
-// undocumented — discovered via browser devtools, same caveats apply.
+// alerts.energy — covers all 27 regions in one place.
 const ALERTS_ENERGY_BASE = "https://alerts.energy/api/v1/source-registry/areas";
-// Slugs match exactly what alerts.energy uses in its own page URLs.
 const ALERTS_ENERGY_REGIONS = [
   "avtonomna-respublika-krym", "vinnytska-oblast", "volynska-oblast",
   "dnipropetrovska-oblast", "donetska-oblast", "zhytomyrska-oblast",
@@ -42,7 +36,7 @@ const ALERTS_ENERGY_REGIONS = [
   "khmelnytska-oblast", "cherkaska-oblast", "chernivecka-oblast",
   "chernigivska-oblast", "sevastopol", "kyiv",
 ];
-const alertsEnergyCache = {}; // keyed by region slug -> { data, fetchedAt }
+const alertsEnergyCache = {};
 
 async function fetchAlertsEnergy(regionSlug) {
   const now = Date.now();
@@ -69,11 +63,6 @@ async function fetchAlertsEnergy(regionSlug) {
   return json;
 }
 
-// alerts.energy's "today"/"tomorrow" arrays can be 24 (hourly) or 48
-// (half-hourly) long. This samples evenly into a 24-slot on/off grid
-// regardless of the source resolution. 0 = no outage (assumed based on
-// an all-clear day observed while building this — unconfirmed against
-// an actual outage example).
 function alertsEnergyArrayToHours(arr) {
   const hours = Array(24).fill(true);
   if (!Array.isArray(arr) || arr.length === 0) return hours;
@@ -84,12 +73,10 @@ function alertsEnergyArrayToHours(arr) {
   return hours;
 }
 
-// GET /api/alerts-energy/regions — list of supported region slugs
 app.get("/api/alerts-energy/regions", (req, res) => {
   res.json({ regions: ALERTS_ENERGY_REGIONS });
 });
 
-// GET /api/alerts-energy/raw?region=lvivska-oblast
 app.get("/api/alerts-energy/raw", async (req, res) => {
   const region = req.query.region;
   if (!region) return res.status(400).json({ error: "Pass ?region=lvivska-oblast (see /api/alerts-energy/regions for the full list)." });
@@ -101,8 +88,6 @@ app.get("/api/alerts-energy/raw", async (req, res) => {
   }
 });
 
-// GET /api/alerts-energy/schedule?region=lvivska-oblast
-// Returns every queue for the region, each converted to a 24-slot grid.
 app.get("/api/alerts-energy/schedule", async (req, res) => {
   const region = req.query.region;
   if (!region) return res.status(400).json({ error: "Pass ?region=lvivska-oblast." });
@@ -156,7 +141,6 @@ async function fetchYasnoPlannedOutages(region) {
   return json;
 }
 
-// GET /api/schedule/raw?region=kiev
 app.get("/api/schedule/raw", async (req, res) => {
   const region = (req.query.region || "kiev").toLowerCase();
   try {
@@ -167,7 +151,6 @@ app.get("/api/schedule/raw", async (req, res) => {
   }
 });
 
-// GET /api/schedule?region=kiev
 app.get("/api/schedule", async (req, res) => {
   const region = (req.query.region || "kiev").toLowerCase();
   try {
@@ -184,7 +167,6 @@ app.get("/api/schedule", async (req, res) => {
   }
 });
 
-// GET /api/schedule/group?region=kiev&group=1.1
 app.get("/api/schedule/group", async (req, res) => {
   const region = (req.query.region || "kiev").toLowerCase();
   const group = req.query.group;
@@ -214,9 +196,6 @@ app.get("/api/schedule/group", async (req, res) => {
   }
 });
 
-// Confirmed real shape (checked 2026-09-03) — raw is an object keyed
-// directly by group, e.g. { "1.1": { today: { slots: [...], status,
-// date }, tomorrow: {...}, updatedOn }, "2.1": {...}, ... }.
 function extractGroups(raw) {
   try {
     const groups = {};
@@ -236,9 +215,6 @@ function extractGroups(raw) {
   }
 }
 
-// Pulls each group's status/date info alongside the parsed windows, so
-// the frontend can show "no outages scheduled today" instead of an
-// ambiguous empty grid.
 function extractGroupStatuses(raw) {
   const statuses = {};
   for (const [groupKey, groupData] of Object.entries(raw || {})) {
@@ -251,8 +227,6 @@ function extractGroupStatuses(raw) {
   return statuses;
 }
 
-// Normalizes either a fractional-hour number (12.5) or an ISO/time string
-// into a fractional-hour number for the frontend's 24-slot grid.
 function toHourFraction(value) {
   if (typeof value === "number") return value;
   if (typeof value === "string") {
@@ -267,6 +241,117 @@ function toHourFraction(value) {
   }
   return NaN;
 }
+
+// ---- Air raid alerts (alarmmap.online) ----
+const ALARM_MONITORING_URL = "https://alarmmap.online/api/v1/monitoring";
+const ALARM_GEO_BASE = "https://alarmmap.online/api/v1/geo";
+const ALARM_SNAPSHOT_TTL_MS = 90 * 1000;
+const ALARM_LISTEN_MS = 4000;
+
+let alarmSnapshotCache = { data: null, fetchedAt: 0 };
+const geoNameCache = {};
+
+async function collectAlarmSnapshot() {
+  const now = Date.now();
+  if (alarmSnapshotCache.data && now - alarmSnapshotCache.fetchedAt < ALARM_SNAPSHOT_TTL_MS) {
+    return alarmSnapshotCache.data;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ALARM_LISTEN_MS);
+  const alerts = {};
+
+  try {
+    const res = await fetch(ALARM_MONITORING_URL, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; outage-schedule-proxy/1.0)",
+        "Accept": "text/event-stream",
+        "Referer": "https://alarmmap.online/",
+      },
+    });
+    if (!res.ok || !res.body) throw new Error(`alarmmap monitoring responded with ${res.status}`);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split("\n\n");
+      buffer = blocks.pop() || "";
+      for (const block of blocks) {
+        let eventType = null, data = null;
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event:")) eventType = line.slice(6).trim();
+          if (line.startsWith("data:")) data = line.slice(5).trim();
+        }
+        if (eventType === "events" && data) {
+          try {
+            const parsed = JSON.parse(data);
+            const arr = Array.isArray(parsed) ? parsed : [parsed];
+            for (const item of arr) {
+              if (item && item.katottg) {
+                alerts[item.katottg] = { type: item.type || "unknown", end: item.end ?? null };
+              }
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch (err) {
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  alarmSnapshotCache = { data: alerts, fetchedAt: now };
+  return alerts;
+}
+
+async function resolveKatottgName(katottg) {
+  if (geoNameCache[katottg]) return geoNameCache[katottg];
+  try {
+    const res = await fetch(`${ALARM_GEO_BASE}/${katottg}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; outage-schedule-proxy/1.0)",
+        "Accept": "application/json",
+        "Referer": "https://alarmmap.online/",
+      },
+    });
+    if (!res.ok) return { full_name: null, path: null };
+    const json = await res.json();
+    const info = {
+      full_name: json?.properties?.full_name || null,
+      path: json?.properties?.path || null,
+    };
+    geoNameCache[katottg] = info;
+    return info;
+  } catch {
+    return { full_name: null, path: null };
+  }
+}
+
+app.get("/api/air-alerts", async (req, res) => {
+  try {
+    const snapshot = await collectAlarmSnapshot();
+    const active = Object.entries(snapshot).filter(([, v]) => v.end === null);
+    const resolved = await Promise.all(
+      active.map(async ([katottg, v]) => {
+        const name = await resolveKatottgName(katottg);
+        return { katottg, type: v.type, ...name };
+      })
+    );
+    res.json({
+      alerts: resolved,
+      collectedAt: new Date(alarmSnapshotCache.fetchedAt).toISOString(),
+      source: "unofficial alarmmap.online live stream, briefly sampled — NOT an official alert system, may miss alerts that started before sampling and never re-fired; for real safety decisions use the official «Повітряна тривога» app or DSNS sirens",
+    });
+  } catch (err) {
+    res.status(502).json({ error: "Could not reach the upstream alert source.", detail: err.message });
+  }
+});
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
