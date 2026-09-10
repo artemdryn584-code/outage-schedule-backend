@@ -242,111 +242,64 @@ function toHourFraction(value) {
   return NaN;
 }
 
-// ---- Air raid alerts (alarmmap.online) ----
-const ALARM_MONITORING_URL = "https://alarmmap.online/api/v1/monitoring";
-const ALARM_GEO_BASE = "https://alarmmap.online/api/v1/geo";
-const ALARM_SNAPSHOT_TTL_MS = 90 * 1000;
-const ALARM_LISTEN_MS = 4000;
+// ---- Air raid alerts (official alerts.in.ua API) ----
+// Real, documented API — replaces the earlier alarmmap.online SSE-sniffing
+// hack. Requires a token from https://devs.alerts.in.ua/ (volunteer-run,
+// free). The token lives in an environment variable, never in this file —
+// this repo is public on GitHub, so a hardcoded token would leak instantly.
+//
+// Set ALERTS_IN_UA_TOKEN in Render's dashboard (via an Environment Group
+// linked to this service, or directly on the service).
+const ALERTS_IN_UA_TOKEN = process.env.ALERTS_IN_UA_TOKEN;
+const ALERTS_IN_UA_URL = "https://api.alerts.in.ua/v1/alerts/active.json";
+const OFFICIAL_ALERTS_TTL_MS = 60 * 1000;
 
-let alarmSnapshotCache = { data: null, fetchedAt: 0 };
-const geoNameCache = {};
+let officialAlertsCache = { data: null, fetchedAt: 0 };
 
-async function collectAlarmSnapshot() {
+async function fetchOfficialAlerts() {
   const now = Date.now();
-  if (alarmSnapshotCache.data && now - alarmSnapshotCache.fetchedAt < ALARM_SNAPSHOT_TTL_MS) {
-    return alarmSnapshotCache.data;
+  if (officialAlertsCache.data && now - officialAlertsCache.fetchedAt < OFFICIAL_ALERTS_TTL_MS) {
+    return officialAlertsCache.data;
   }
+  if (!ALERTS_IN_UA_TOKEN) {
+    throw new Error("ALERTS_IN_UA_TOKEN is not set on the server (add it in Render's Environment settings).");
+  }
+  const res = await fetch(ALERTS_IN_UA_URL, {
+    headers: { "Authorization": `Bearer ${ALERTS_IN_UA_TOKEN}` },
+  });
+  if (!res.ok) {
+    throw new Error(`alerts.in.ua responded with ${res.status}`);
+  }
+  const json = await res.json();
+  officialAlertsCache = { data: json, fetchedAt: now };
+  return json;
+}
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), ALARM_LISTEN_MS);
-  const alerts = {};
-
+app.get("/api/air-alerts/raw", async (req, res) => {
   try {
-    const res = await fetch(ALARM_MONITORING_URL, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; outage-schedule-proxy/1.0)",
-        "Accept": "text/event-stream",
-        "Referer": "https://alarmmap.online/",
-      },
-    });
-    if (!res.ok || !res.body) throw new Error(`alarmmap monitoring responded with ${res.status}`);
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const blocks = buffer.split("\n\n");
-      buffer = blocks.pop() || "";
-      for (const block of blocks) {
-        let eventType = null, data = null;
-        for (const line of block.split("\n")) {
-          if (line.startsWith("event:")) eventType = line.slice(6).trim();
-          if (line.startsWith("data:")) data = line.slice(5).trim();
-        }
-        if (eventType === "events" && data) {
-          try {
-            const parsed = JSON.parse(data);
-            const arr = Array.isArray(parsed) ? parsed : [parsed];
-            for (const item of arr) {
-              if (item && item.katottg) {
-                alerts[item.katottg] = { type: item.type || "unknown", end: item.end ?? null };
-              }
-            }
-          } catch {}
-        }
-      }
-    }
+    const raw = await fetchOfficialAlerts();
+    res.json(raw);
   } catch (err) {
-  } finally {
-    clearTimeout(timeout);
+    res.status(502).json({ error: "Could not reach alerts.in.ua.", detail: err.message });
   }
-
-  alarmSnapshotCache = { data: alerts, fetchedAt: now };
-  return alerts;
-}
-
-async function resolveKatottgName(katottg) {
-  if (geoNameCache[katottg]) return geoNameCache[katottg];
-  try {
-    const res = await fetch(`${ALARM_GEO_BASE}/${katottg}`, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; outage-schedule-proxy/1.0)",
-        "Accept": "application/json",
-        "Referer": "https://alarmmap.online/",
-      },
-    });
-    if (!res.ok) return { full_name: null, path: null };
-    const json = await res.json();
-    const info = {
-      full_name: json?.properties?.full_name || null,
-      path: json?.properties?.path || null,
-    };
-    geoNameCache[katottg] = info;
-    return info;
-  } catch {
-    return { full_name: null, path: null };
-  }
-}
+});
 
 app.get("/api/air-alerts", async (req, res) => {
   try {
-    const snapshot = await collectAlarmSnapshot();
-    const active = Object.entries(snapshot).filter(([, v]) => v.end === null);
-    const resolved = await Promise.all(
-      active.map(async ([katottg, v]) => {
-        const name = await resolveKatottgName(katottg);
-        return { katottg, type: v.type, ...name };
-      })
-    );
+    const raw = await fetchOfficialAlerts();
+    const list = Array.isArray(raw) ? raw : raw.alerts || [];
+    const airRaid = list.filter(a => (a.alert_type || a.alertType) === "air_raid");
+    const alerts = airRaid.map(a => ({
+      location_oblast: a.location_oblast ?? a.locationOblast ?? null,
+      location_raion: a.location_raion ?? a.locationRaion ?? null,
+      location_title: a.location_title ?? a.locationTitle ?? null,
+      alert_type: a.alert_type ?? a.alertType ?? null,
+      started_at: a.started_at ?? a.startedAt ?? null,
+    }));
     res.json({
-      alerts: resolved,
-      collectedAt: new Date(alarmSnapshotCache.fetchedAt).toISOString(),
-      source: "unofficial alarmmap.online live stream, briefly sampled — NOT an official alert system, may miss alerts that started before sampling and never re-fired; for real safety decisions use the official «Повітряна тривога» app or DSNS sirens",
+      alerts,
+      collectedAt: new Date(officialAlertsCache.fetchedAt).toISOString(),
+      source: "official alerts.in.ua API (https://devs.alerts.in.ua) — still verify against the official app or sirens for anything safety-critical",
     });
   } catch (err) {
     res.status(502).json({ error: "Could not reach the upstream alert source.", detail: err.message });
